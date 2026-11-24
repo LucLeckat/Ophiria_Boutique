@@ -1,0 +1,595 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="robots" content="noindex,nofollow">
+<title>Gestion · Ophiria Boutique</title>
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="icon" href="favicon.png" type="image/png" sizes="64x64">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<meta name="theme-color" content="#141414">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <div class="brand"><span class="logo-sm"><img src="logo.jpg" width="700" height="406" alt="Ophiria Boutique"></span><span id="brand">Gestion</span></div>
+    <div id="who" class="row" hidden><span class="small muted" id="email"></span><button class="btn sm" data-act="logout">Se déconnecter</button></div>
+  </header>
+  <main id="main"><div class="empty">Chargement…</div></main>
+</div>
+<div id="toast" class="toast" hidden></div>
+
+<script src="vendor/supabase.js"></script>
+<script src="config.js"></script>
+<script src="shared.js"></script>
+<script>
+(function () {
+'use strict';
+var B = window.B, sb = B.sb, esc = B.esc, money = B.money, toast = B.toast;
+var $ = function (s) { return document.querySelector(s); };
+var STATUS = ['à vérifier', 'payée', 'préparée', 'expédiée', 'livrée', 'annulée', 'expirée'];
+var COL = { 'à vérifier': 'var(--warn)', 'payée': 'var(--accent)', 'préparée': 'var(--info)', 'expédiée': 'var(--violet)', 'livrée': 'var(--ok)', 'annulée': 'var(--muted)', 'expirée': 'var(--muted)' };
+var PAID = ['payée', 'préparée', 'expédiée', 'livrée'];
+var PAGE = 40;        // commandes affichees a la fois
+var BATCH = 1000;     // lignes demandees par lot pour les exports
+var EXPORT_DAYS = 7;  // rappel de sauvegarde
+
+var SET = null, ORDERS = [], PRODUCTS = [];
+var STATS = { pending: 0, paid: 0, today: 0, ca: 0 };
+var ui = { tab: 'orders', of: 'toutes', oq: '', from: '', to: '', total: 0, oreq: 0, loading: false, loadErr: false, more: false, refreshing: false, exporting: false,
+  confirm: null, proofOpen: null, proofUrls: {}, edit: null, adding: false,
+  img: undefined, sound: lsGet('boutique-son') !== '0', user: null, channel: null, timer: null, busy: false, searchTimer: null };
+var audioCtx = null;
+
+function lsGet(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
+function lsSet(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
+function opts(list, v) { return list.map(function (x) { return '<option' + (x === v ? ' selected' : '') + '>' + esc(x) + '</option>'; }).join(''); }
+function pad(n) { return String(n).padStart(4, '0'); }
+function fail(m, e) { console.error(e); toast(m); }
+
+/* ---------- Connexion ---------- */
+function loginHTML(msg) {
+  return '<form class="panel login form" id="login"><h2>Espace Gestion</h2>' +
+    '<label>Adresse e-mail<input id="l-email" type="email" required autocomplete="username"></label>' +
+    '<label>Mot de passe<input id="l-pass" type="password" required autocomplete="current-password"></label>' +
+    '<div class="err" id="l-err">' + esc(msg || '') + '</div><button class="btn p" type="submit">Se connecter</button></form>';
+}
+async function start() {
+  try {
+    var s = await sb.auth.getSession();
+    if (!s.data.session) { $('#main').innerHTML = loginHTML(); return; }
+    await enter(s.data.session.user);
+  } catch (e) { $('#main').innerHTML = loginHTML('Connexion impossible. Vérifiez votre réseau.'); }
+}
+async function enter(user) {
+  var ok = await sb.rpc('is_admin');
+  if (ok.error || ok.data !== true) {
+    await sb.auth.signOut();
+    $('#main').innerHTML = loginHTML('Ce compte n\'a pas accès à l\'espace Gestion.');
+    return;
+  }
+  ui.user = user;
+  $('#email').textContent = user.email || '';
+  $('#who').hidden = false;
+  await Promise.all([loadSettings(), loadProducts()]);
+  try { await sb.rpc('release_expired_orders'); } catch (e) {}
+  await Promise.all([loadStats(), loadOrders(false)]);
+  draw();
+  listen();
+}
+async function loadSettings() {
+  var r = await sb.from('settings').select('*').eq('id', 1).single();
+  if (r.error) throw r.error;
+  SET = r.data; B.setCurrency(SET.currency);
+  document.title = 'Gestion · ' + SET.shop_name;
+  $('#brand').textContent = 'Gestion';
+}
+/* Filtres communs a la liste et a l'export : statut, dates, recherche. */
+function dayStart(str, plus) { var p = str.split('-'); return new Date(+p[0], +p[1] - 1, +p[2] + plus); }
+function filtered() { return ui.of !== 'toutes' || ui.from || ui.to || ui.oq.trim(); }
+function orderFilter(q) {
+  if (ui.of !== 'toutes') q = q.eq('status', ui.of);
+  if (ui.from) q = q.gte('created_at', dayStart(ui.from, 0).toISOString());
+  if (ui.to) q = q.lt('created_at', dayStart(ui.to, 1).toISOString());
+  var s = ui.oq.trim().replace(/[,()*%\\"']/g, ' ').replace(/\s+/g, ' ').trim();
+  if (s) {
+    var parts = ['customer_name.ilike.*' + s + '*', 'phone.ilike.*' + s + '*', 'txn_ref.ilike.*' + s + '*'];
+    var d = s.replace(/\D/g, '');
+    if (d.length >= 3) parts.push('phone_key.ilike.*' + d + '*');
+    var m = s.match(/^(?:cmd-?)?0*(\d{1,9})$/i);
+    if (m) parts.push('order_no.eq.' + parseInt(m[1], 10));
+    q = q.or(parts.join(','));
+  }
+  return q;
+}
+/* Charge une page de commandes. append = page suivante ; sinon recharge ce qui est deja affiche. */
+async function loadOrders(append) {
+  var token = ++ui.oreq;
+  var from = append ? ORDERS.length : 0;
+  var to = append ? from + PAGE - 1 : Math.max(ORDERS.length, PAGE) - 1;
+  var r = await orderFilter(sb.from('orders').select('*, order_items(*)', { count: 'exact' }))
+    .order('created_at', { ascending: false }).order('order_no', { ascending: false }).range(from, to);
+  if (token !== ui.oreq) return false;           // une demande plus recente a pris le relais
+  if (r.error) throw r.error;
+  if (append) {
+    var have = {}; ORDERS.forEach(function (o) { have[o.id] = 1; });
+    ORDERS = ORDERS.concat(r.data.filter(function (o) { return !have[o.id]; }));
+  } else ORDERS = r.data;
+  ui.total = r.count == null ? ORDERS.length : r.count;
+  return true;
+}
+/* Chiffres du haut de page : des comptages, sans charger les commandes. */
+async function loadStats() {
+  var mid = new Date(); mid.setHours(0, 0, 0, 0);
+  var iso = mid.toISOString();
+  var head = function (f) { return f(sb.from('orders').select('id', { count: 'exact', head: true })); };
+  var rs = await Promise.all([
+    head(function (q) { return q.eq('status', 'à vérifier'); }),
+    head(function (q) { return q.eq('status', 'payée'); }),
+    head(function (q) { return q.gte('created_at', iso); }),
+    sb.from('orders').select('total').gte('created_at', iso).in('status', PAID).limit(1000)
+  ]);
+  for (var i = 0; i < rs.length; i++) if (rs[i].error) throw rs[i].error;
+  STATS = { pending: rs[0].count || 0, paid: rs[1].count || 0, today: rs[2].count || 0,
+    ca: (rs[3].data || []).reduce(function (t, o) { return t + o.total; }, 0) };
+}
+async function loadProducts() {
+  var r = await sb.from('products').select('*, product_sizes(id,size,stock,sort)').order('created_at', { ascending: false });
+  if (r.error) throw r.error;
+  PRODUCTS = r.data;
+}
+function beep() {
+  if (!ui.sound || !audioCtx) return;
+  try {
+    var o = audioCtx.createOscillator(), g = audioCtx.createGain();
+    o.type = 'sine'; o.frequency.value = 880; g.gain.value = 0.15;
+    o.connect(g); g.connect(audioCtx.destination); o.start(); o.stop(audioCtx.currentTime + 0.25);
+  } catch (e) {}
+}
+function listen() {
+  if (ui.channel) return;
+  try {
+    ui.channel = sb.channel('orders-live').on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'orders' }, function (p) {
+      beep(); toast('Nouvelle commande CMD-' + pad(p.new.order_no));
+      refresh(true);
+    }).subscribe();
+  } catch (e) {}
+  ui.timer = setInterval(function () { if (!document.hidden && ui.tab === 'orders') refresh(true); }, 60000);
+}
+async function refresh(quiet) {
+  if (ui.refreshing) return;
+  ui.refreshing = true;
+  try {
+    var rel = await sb.rpc('release_expired_orders');     // libere le stock des commandes jamais payees
+    var jobs = [loadStats(), loadOrders(false)];
+    if (rel && rel.data > 0) jobs.push(loadProducts());
+    await Promise.all(jobs);
+    drawStats();
+    if (ui.tab === 'orders') ordersList();
+  } catch (e) { if (!quiet) fail('Actualisation impossible', e); }
+  finally { ui.refreshing = false; }
+}
+/* Applique un changement de filtre : repart de la premiere page. */
+async function applyFilter() {
+  ORDERS = []; ui.loading = true; ui.loadErr = false; ordersList();
+  try { if (!(await loadOrders(false))) return; }
+  catch (e) { console.error(e); ui.loadErr = true; ORDERS = []; ui.total = 0; }
+  ui.loading = false; ordersList();
+}
+
+/* ---------- Affichage ---------- */
+function statsHTML() {
+  var low = PRODUCTS.filter(function (p) { return p.active && B.totalStock(p) <= 3; }).length;
+  return '<div class="stat"><b>' + STATS.pending + '</b><span>paiements à vérifier</span></div>' +
+    '<div class="stat"><b>' + STATS.paid + '</b><span>à préparer</span></div>' +
+    '<div class="stat"><b>' + STATS.today + '</b><span>commandes aujourd\'hui</span></div>' +
+    '<div class="stat"><b>' + money(STATS.ca) + '</b><span>encaissé aujourd\'hui</span></div>' +
+    '<div class="stat"><b>' + low + '</b><span>articles presque épuisés</span></div>';
+}
+function drawStats() { var el = $('#stats'); if (el) el.innerHTML = statsHTML(); }
+function draw() {
+  var tabs = [['orders', 'Commandes'], ['stock', 'Articles et stocks'], ['set', 'Réglages']];
+  $('#main').innerHTML = '<div class="stats" id="stats">' + statsHTML() + '</div>' +
+    '<div class="seg" style="width:max-content;max-width:100%;margin-bottom:14px" role="group">' + tabs.map(function (t) {
+      return '<button data-act="tab" data-t="' + t[0] + '" aria-pressed="' + (ui.tab === t[0]) + '">' + t[1] + '</button>';
+    }).join('') + '</div><div id="tab">' + (ui.tab === 'orders' ? ordersHTML() : ui.tab === 'stock' ? stockHTML() : settingsHTML()) + '</div>';
+  if (ui.tab === 'orders') ordersList();
+}
+
+/* ----- Commandes ----- */
+function lastExport() { return +lsGet('boutique-dernier-export') || 0; }
+function backupBanner() {
+  var last = lastExport(), days = last ? Math.floor((Date.now() - last) / 864e5) : null;
+  if (last && days < EXPORT_DAYS) return '';
+  return '<div class="banner"><span class="small">' + (last ? 'Dernière sauvegarde il y a ' + days + ' jours.' : 'Aucune sauvegarde faite depuis l\'ouverture de cet espace.') +
+    ' Une sauvegarde par semaine protège vos commandes et vos stocks.</span><button class="btn sm p" data-act="backup">Sauvegarder maintenant</button></div>';
+}
+function ordersHTML() {
+  return backupBanner() + '<div class="tools"><input type="search" id="oq" placeholder="Nom, téléphone, numéro ou ID de transaction" aria-label="Rechercher une commande" value="' + esc(ui.oq) + '">' +
+    '<select id="of" aria-label="Filtrer par statut"><option value="toutes">Tous les statuts</option>' + opts(STATUS, ui.of) + '</select></div>' +
+    '<div class="tools"><label class="small muted" style="display:flex;gap:6px;align-items:center">Du <input type="date" id="df" value="' + esc(ui.from) + '"></label>' +
+    '<label class="small muted" style="display:flex;gap:6px;align-items:center">au <input type="date" id="dt" value="' + esc(ui.to) + '"></label>' +
+    '<button class="btn sm" data-act="cleardates"' + (ui.from || ui.to ? '' : ' hidden') + '>Effacer les dates</button>' +
+    '<button class="btn sm" data-act="csv">Exporter cette liste (CSV)</button>' +
+    '<label class="small muted" style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="snd"' + (ui.sound ? ' checked' : '') + '> Son à chaque commande</label></div><div id="olist"></div>';
+}
+function ordersList() {
+  var el = $('#olist'); if (!el) return;
+  if (ui.loading) { el.innerHTML = '<div class="empty">Chargement…</div>'; return; }
+  if (ui.loadErr) { el.innerHTML = '<div class="empty">Chargement impossible. Vérifiez votre connexion puis changez un filtre pour réessayer.</div>'; return; }
+  var head = '<div class="small muted" style="margin-bottom:8px">' + ui.total + ' commande' + (ui.total > 1 ? 's' : '') + (filtered() ? ' pour ce filtre' : '') + '</div>';
+  el.innerHTML = ORDERS.length ? head + ORDERS.map(orderHTML).join('') +
+    (ORDERS.length < ui.total ? '<button class="btn more" data-act="more"' + (ui.more ? ' disabled' : '') + '>' + (ui.more ? 'Chargement…' : 'Voir plus de commandes') + '</button>' : '') :
+    '<div class="empty">' + (filtered() ? 'Aucune commande pour ce filtre.' : 'Aucune commande pour le moment.') + '</div>';
+}
+function holdLeft(o) {
+  var h = SET && SET.hold_hours;
+  if (!h || o.status !== 'à vérifier') return '';
+  var ms = new Date(o.hold_from || o.created_at).getTime() + h * 36e5 - Date.now();
+  if (ms <= 0) return '<div class="small muted">Stock réservé : le délai est dépassé, la commande va expirer.</div>';
+  var m = Math.ceil(ms / 6e4);
+  return '<div class="small muted">Stock réservé encore ' + (m >= 60 ? Math.floor(m / 60) + ' h ' + String(m % 60).padStart(2, '0') : m + ' min') + ' sans paiement validé.</div>';
+}
+function orderHTML(o) {
+  var items = (o.order_items || []).map(function (i) { return i.qty + ' × ' + esc(i.product_name) + (i.size !== 'unique' ? ' (' + esc(i.size) + ')' : ''); }).join(' · ');
+  var proof = '';
+  if (o.proof_path) {
+    proof = '<div><button class="linkbtn small" data-act="proof" data-id="' + o.id + '">' + (ui.proofOpen === o.id ? 'Masquer la preuve de paiement' : 'Voir la preuve de paiement') + '</button></div>';
+    if (ui.proofOpen === o.id) proof += ui.proofUrls[o.id] === 'missing' ? '<div class="small muted">Capture introuvable ou supprimée.</div>' :
+      ui.proofUrls[o.id] ? '<img class="proof" src="' + esc(ui.proofUrls[o.id]) + '" alt="Preuve de paiement de ' + esc(o.customer_name) + '">' : '<div class="small muted">Chargement…</div>';
+  } else proof = '<div class="small muted">Capture supprimée</div>';
+  var actions;
+  if (o.status === 'annulée') actions = '<span class="small muted">Annulée, stock remis en rayon</span>';
+  else if (o.status === 'expirée') actions = '<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center"><span class="small muted">Expirée, stock remis en rayon</span>' +
+    '<button class="btn sm" data-act="reinstate" data-id="' + o.id + '">Remettre en attente</button></div>';
+  else actions = '<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">' +
+    (o.status === 'à vérifier' ? '<button class="btn sm p" data-act="paid" data-id="' + o.id + '">Valider le paiement</button>' :
+      '<select data-act="status" data-id="' + o.id + '" aria-label="Changer le statut">' + opts(['payée', 'préparée', 'expédiée', 'livrée'], o.status) + '</select>') +
+    '<button class="btn sm d" data-act="cancel" data-id="' + o.id + '">' + (ui.confirm === o.id ? 'Confirmer l\'annulation' : o.status === 'à vérifier' ? 'Refuser' : 'Annuler') + '</button></div>';
+  var ref = o.txn_ref ? '<div class="small muted">ID de transaction : <button class="linkbtn" data-act="searchref" data-ref="' + esc(o.txn_ref) + '" title="Chercher les commandes avec cet ID">' + esc(o.txn_ref) + '</button>' +
+    (o.ref_dup ? ' <span class="pill" style="--c:var(--bad)">ID déjà utilisé sur une autre commande</span>' : '') + '</div>' : '';
+  return '<div class="order' + (o.status === 'à vérifier' ? ' todo' : '') + '"><div class="row" style="flex-wrap:wrap"><div style="min-width:0"><b>CMD-' + pad(o.order_no) + '</b> · ' + esc(o.customer_name) +
+    '<div class="small muted">' + new Date(o.created_at).toLocaleString('fr-FR', { dateStyle: 'short', timeStyle: 'short' }) + ' · ' + esc(o.phone) + ' · ' + esc(o.city) + ' · ' + esc(o.wa_group) + ' · ' + esc(o.delivery) + '</div></div>' +
+    '<span class="pill" style="--c:' + COL[o.status] + '">' + o.status + '</span></div>' +
+    '<div class="small">' + items + '</div>' +
+    (o.note ? '<div class="small muted">Livraison : ' + esc(o.note) + '</div>' : '') + ref + holdLeft(o) + proof +
+    '<div class="row" style="flex-wrap:wrap"><b>' + money(o.total) + '</b>' + actions + '</div></div>';
+}
+function rpcMessage(err) {
+  var m = (err && err.message) || '', x;
+  if ((x = m.match(/STOCK:([^|]*)\|([^|]*)\|(\d+)/))) return 'Pas assez de stock : ' + x[1] + (x[2] !== 'unique' ? ' (' + x[2] + ')' : '') + ', il en reste ' + x[3] + '.';
+  if (m.indexOf('UNAVAILABLE:') >= 0) return 'Un article de cette commande n\'existe plus.';
+  return m;
+}
+async function setStatus(id, status, okMsg) {
+  var r = await sb.rpc('set_order_status', { p_id: id, p_status: status });
+  if (r.error) { fail('Action impossible : ' + rpcMessage(r.error), r.error); return; }
+  try { await Promise.all([loadOrders(false), loadProducts(), loadStats()]); } catch (e) {}
+  ui.confirm = null; draw(); toast(okMsg);
+}
+async function reinstate(id) {
+  var r = await sb.rpc('reinstate_order', { p_id: id });
+  if (r.error) { fail(rpcMessage(r.error), r.error); return; }
+  try { await Promise.all([loadOrders(false), loadProducts(), loadStats()]); } catch (e) {}
+  draw(); toast('Commande remise en attente, stock repris');
+}
+async function showProof(id) {
+  ui.proofOpen = ui.proofOpen === id ? null : id;
+  ordersList();
+  if (ui.proofOpen === id && !ui.proofUrls[id]) {
+    var o = ORDERS.find(function (x) { return x.id === id; });
+    var r = await sb.storage.from('proofs').createSignedUrl(o.proof_path, 600);
+    ui.proofUrls[id] = r.error || !r.data ? 'missing' : r.data.signedUrl;
+    ordersList();
+  }
+}
+/* ----- Exports ----- */
+function cell(c) {
+  var t = String(c == null ? '' : c);
+  // Un texte qui commence par = + - @ serait lu comme une formule par Excel : on le neutralise (sauf un numero de telephone).
+  if (typeof c === 'string' && /^[=+\-@]/.test(t) && !/^\+?[\d\s().-]+$/.test(t)) t = "'" + t;
+  return '"' + t.replace(/"/g, '""') + '"';
+}
+function download(name, rows) {
+  var text = rows.map(function (r) { return r.map(cell).join(';'); }).join('\r\n');
+  var blob = new Blob(['﻿' + text], { type: 'text/csv;charset=utf-8' });
+  var a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(function () { URL.revokeObjectURL(a.href); }, 2000);
+}
+function day() { return new Date().toISOString().slice(0, 10); }
+async function fetchAllOrders(useFilter) {
+  var out = [], from = 0;
+  for (;;) {
+    var q = sb.from('orders').select('*, order_items(*)');
+    if (useFilter) q = orderFilter(q);
+    var r = await q.order('order_no', { ascending: true }).range(from, from + BATCH - 1);
+    if (r.error) throw r.error;
+    if (!r.data.length) break;
+    out = out.concat(r.data); from += r.data.length;
+    toast('Préparation… ' + out.length + ' commandes');
+    if (from > 200000) break;
+  }
+  return out;
+}
+function orderRows(list) {
+  var rows = [['Numéro', 'Date', 'Nom', 'Téléphone', 'Groupe', 'Ville', 'Livraison', 'Précisions', 'ID transaction', 'ID déjà utilisé', 'Articles', 'Total', 'Statut']];
+  list.forEach(function (o) {
+    rows.push(['CMD-' + pad(o.order_no), new Date(o.created_at).toLocaleString('fr-FR'), o.customer_name, o.phone, o.wa_group, o.city, o.delivery, o.note, o.txn_ref, o.ref_dup ? 'oui' : '',
+      (o.order_items || []).map(function (i) { return i.qty + ' x ' + i.product_name + (i.size !== 'unique' ? ' (' + i.size + ')' : ''); }).join(' | '), o.total, o.status]);
+  });
+  return rows;
+}
+async function exportOrders(all) {
+  var list = await fetchAllOrders(!all);
+  if (!list.length) { toast('Aucune commande à exporter'); return false; }
+  var label = all ? 'toutes' : (ui.from || ui.to ? (ui.from || 'debut') + '_au_' + (ui.to || 'ce-jour') : 'liste');
+  download('commandes-' + label + '-' + day() + '.csv', orderRows(list));
+  toast(list.length + ' commandes exportées');
+  return true;
+}
+async function exportStock() {
+  await loadProducts();
+  var rows = [['Article', 'Catégorie', 'Prix', 'Taille', 'Stock', 'Visible', 'Lien vidéo']];
+  PRODUCTS.forEach(function (p) {
+    B.sizesOf(p).forEach(function (s) { rows.push([p.name, p.category, p.price, s.size === 'unique' ? '' : s.size, s.stock, p.active ? 'oui' : 'non', p.video_url || '']); });
+  });
+  download('articles-et-stocks-' + day() + '.csv', rows);
+  toast('Articles et stocks exportés');
+}
+async function runExport(kind) {
+  if (ui.exporting) return;
+  ui.exporting = true;
+  try {
+    if (kind === 'list') await exportOrders(false);
+    else if (kind === 'all') { if (await exportOrders(true)) lsSet('boutique-dernier-export', String(Date.now())); }
+    else if (kind === 'stock') await exportStock();
+    else if (kind === 'backup') {
+      if (await exportOrders(true)) { await new Promise(function (r) { setTimeout(r, 600); }); await exportStock(); lsSet('boutique-dernier-export', String(Date.now())); }
+    }
+    if (kind === 'all' || kind === 'backup') draw();
+  } catch (e) { fail('Export impossible. Vérifiez votre connexion.', e); }
+  finally { ui.exporting = false; }
+}
+
+/* ----- Articles ----- */
+function sizesText(p) {
+  return B.hasSizes(p) ? B.sizesOf(p).map(function (s) { return s.size + ':' + s.stock; }).join(', ') : '';
+}
+function stockCell(p) {
+  return B.sizesOf(p).map(function (s) {
+    return '<label class="szin">' + (s.size === 'unique' ? '' : esc(s.size)) + '<input type="number" min="0" step="1" value="' + s.stock + '" data-act="qty" data-id="' + s.id + '" aria-label="Stock ' + esc(p.name) + ' ' + esc(s.size) + '"></label>';
+  }).join('');
+}
+function stockHTML() {
+  var e = ui.edit ? PRODUCTS.find(function (p) { return p.id === ui.edit; }) : null;
+  var img = ui.img !== undefined ? ui.img : (e ? B.publicUrl(e.thumb_path || e.image_path) : '');
+  var form = '';
+  if (ui.adding || e) {
+    var single = e && !B.hasSizes(e) ? B.totalStock(e) : '';
+    form = '<form class="panel form" id="pf" style="margin-bottom:14px"><h3>' + (e ? 'Modifier l\'article' : 'Ajouter un article') + '</h3>' +
+      '<div class="two"><label>Nom<input id="p-name" required maxlength="120" value="' + esc(e && e.name) + '"></label>' +
+      '<label>Catégorie<input id="p-cat" list="cats" required maxlength="60" value="' + esc(e ? e.category : '') + '"><datalist id="cats">' +
+      Array.from(new Set(PRODUCTS.map(function (p) { return p.category; }))).map(function (c) { return '<option value="' + esc(c) + '">'; }).join('') + '</datalist></label></div>' +
+      '<div class="two"><label>Prix (' + esc(SET.currency) + ')<input id="p-price" type="number" min="0" step="1" required value="' + (e ? e.price : '') + '"></label>' +
+      '<label>Quantité en stock<input id="p-stock" type="number" min="0" step="1" value="' + single + '" placeholder="Si pas de tailles"></label></div>' +
+      '<label>Tailles et quantités, par exemple S:2, M:3, L:1 (laisser vide s\'il n\'y a pas de tailles)<input id="p-sizes" value="' + esc(e ? sizesText(e) : '') + '"></label>' +
+      '<label>Photo de l\'article<input id="p-img" type="file" accept="image/*"></label>' +
+      '<div id="p-prev">' + (img ? '<img class="thumb lg" src="' + esc(img) + '" alt="Aperçu"> <button class="linkbtn small" type="button" data-act="rmimg">Retirer la photo</button>' : '') + '</div>' +
+      '<label>Lien de la vidéo (facultatif)<input id="p-video" type="url" placeholder="https://" value="' + esc(e && e.video_url) + '"></label>' +
+      '<label style="display:flex;gap:8px;align-items:center;flex-direction:row"><input type="checkbox" id="p-active"' + (!e || e.active ? ' checked' : '') + '> Visible dans la boutique</label>' +
+      '<div class="err" id="p-err"></div><div class="row" style="justify-content:flex-start"><button class="btn p" id="p-save" type="submit">' + (e ? 'Enregistrer' : 'Ajouter') + '</button>' +
+      '<button class="btn" type="button" data-act="canceledit">Annuler</button></div></form>';
+  } else form = '<div style="margin-bottom:14px"><button class="btn p" data-act="newp">Ajouter un article</button></div>';
+  var rows = PRODUCTS.map(function (p) {
+    var t = B.totalStock(p), th = B.publicUrl(p.thumb_path || p.image_path);
+    return '<tr><td style="min-width:180px">' + (th ? '<img class="thumb" src="' + esc(th) + '" alt="" loading="lazy">' : '') + '<b>' + esc(p.name) + '</b></td><td>' + esc(p.category) + '</td><td>' + money(p.price) + '</td><td>' + stockCell(p) + '</td>' +
+      '<td>' + (!p.active ? '<span class="pill" style="--c:var(--muted)">Masqué</span>' : t <= 0 ? '<span class="pill" style="--c:var(--bad)">Épuisé</span>' : t <= 3 ? '<span class="pill" style="--c:var(--warn)">Stock bas</span>' : '') + '</td>' +
+      '<td style="white-space:nowrap"><button class="btn sm" data-act="edit" data-id="' + p.id + '">Modifier</button> <button class="btn sm" data-act="toggle" data-id="' + p.id + '">' + (p.active ? 'Masquer' : 'Afficher') + '</button> ' +
+      '<button class="btn sm d" data-act="del" data-id="' + p.id + '">' + (ui.confirm === p.id ? 'Confirmer' : 'Supprimer') + '</button></td></tr>';
+  }).join('');
+  return form + (PRODUCTS.length ? '<div class="panel scroll" style="padding:6px"><table><thead><tr><th>Article</th><th>Catégorie</th><th>Prix</th><th>Stock</th><th></th><th></th></tr></thead><tbody>' + rows + '</tbody></table></div>' :
+    '<div class="empty">Aucun article pour le moment. Ajoutez le premier avec le bouton ci-dessus.</div>');
+}
+function parseSizes(txt) {
+  var out = [], seen = {}, parts = txt.split(',');
+  for (var i = 0; i < parts.length; i++) {
+    var kv = parts[i].split(':').map(function (s) { return s.trim(); });
+    if (!kv[0] && parts.length === 1) return [];
+    if (!kv[0] || kv[1] === undefined || kv[1] === '' || isNaN(+kv[1]) || kv[0].length > 20 || seen[kv[0].toLowerCase()]) return null;
+    seen[kv[0].toLowerCase()] = 1;
+    out.push({ size: kv[0], stock: Math.max(0, Math.floor(+kv[1])), sort: i });
+  }
+  return out;
+}
+async function saveProduct() {
+  if (ui.busy) return;
+  var err = $('#p-err'), btn = $('#p-save');
+  var e = ui.edit ? PRODUCTS.find(function (p) { return p.id === ui.edit; }) : null;
+  var name = $('#p-name').value.trim(), cat = $('#p-cat').value.trim(), price = Math.max(0, Math.floor(+$('#p-price').value));
+  var sizes = parseSizes($('#p-sizes').value.trim());
+  if (sizes === null) { err.textContent = 'Écrivez les tailles ainsi : S:2, M:3, L:1 (sans doublon).'; return; }
+  if (!sizes.length) sizes = [{ size: 'unique', stock: Math.max(0, Math.floor(+$('#p-stock').value || 0)), sort: 0 }];
+  if (!name || !cat || isNaN(price)) { err.textContent = 'Indiquez un nom, une catégorie et un prix.'; return; }
+  ui.busy = true; btn.disabled = true; btn.textContent = 'Enregistrement…'; err.textContent = '';
+  try {
+    var id = e ? e.id : B.uuid(), imgPath = e ? e.image_path : null, thumbPath = e ? e.thumb_path : null, old = [];
+    var video = $('#p-video').value.trim() || null, active = $('#p-active').checked;
+    if (ui.img !== undefined) {
+      if (imgPath) old.push(imgPath); if (thumbPath) old.push(thumbPath);
+      imgPath = thumbPath = null;
+      if (ui.img && ui.imgBlobs) {
+        var stamp = Date.now().toString(36);
+        imgPath = id + '-' + stamp + '.jpg'; thumbPath = id + '-' + stamp + '-t.jpg';
+        var u1 = await sb.storage.from('products').upload(imgPath, ui.imgBlobs.full, { contentType: 'image/jpeg', upsert: true, cacheControl: '31536000' });
+        if (u1.error) throw u1.error;
+        var u2 = await sb.storage.from('products').upload(thumbPath, ui.imgBlobs.thumb, { contentType: 'image/jpeg', upsert: true, cacheControl: '31536000' });
+        if (u2.error) throw u2.error;
+      }
+    }
+    var row = { id: id, name: name, category: cat, price: price, image_path: imgPath, thumb_path: thumbPath, video_url: video, active: active };
+    var r = e ? await sb.from('products').update(row).eq('id', id) : await sb.from('products').insert(row);
+    if (r.error) throw r.error;
+    var rows = sizes.map(function (s) { return { product_id: id, size: s.size, stock: s.stock, sort: s.sort }; });
+    var up = await sb.from('product_sizes').upsert(rows, { onConflict: 'product_id,size' });
+    if (up.error) throw up.error;
+    if (e) {
+      var keep = sizes.map(function (s) { return s.size; });
+      var gone = (e.product_sizes || []).filter(function (s) { return keep.indexOf(s.size) < 0; }).map(function (s) { return s.id; });
+      if (gone.length) { var d = await sb.from('product_sizes').delete().in('id', gone); if (d.error) throw d.error; }
+    }
+    if (old.length) sb.storage.from('products').remove(old);
+    ui.edit = null; ui.adding = false; ui.img = undefined; ui.imgBlobs = null;
+    await loadProducts(); ui.busy = false; draw(); toast('Article enregistré');
+  } catch (x) {
+    ui.busy = false; console.error(x);
+    err.textContent = 'Enregistrement impossible : ' + (x.message || 'vérifiez votre connexion.');
+    btn.disabled = false; btn.textContent = e ? 'Enregistrer' : 'Ajouter';
+  }
+}
+async function deleteProduct(p) {
+  var r = await sb.from('products').delete().eq('id', p.id);
+  if (r.error) { fail('Suppression impossible', r.error); return; }
+  var files = [p.image_path, p.thumb_path].filter(Boolean);
+  if (files.length) sb.storage.from('products').remove(files);
+  await loadProducts(); ui.confirm = null; draw(); toast('Article supprimé');
+}
+
+/* ----- Reglages ----- */
+function settingsHTML() {
+  var s = SET;
+  return '<form class="panel form" id="sf" style="max-width:520px"><h3>Réglages de la boutique</h3>' +
+    '<label>Nom de la boutique<input id="s-shop" maxlength="80" value="' + esc(s.shop_name) + '"></label>' +
+    '<label>Devise<input id="s-cur" maxlength="10" value="' + esc(s.currency) + '"></label>' +
+    '<h3 style="margin-top:6px">Paiement Mobile Money</h3>' +
+    '<label>Opérateur(s)<input id="s-ops" maxlength="80" value="' + esc(s.momo_ops) + '"></label>' +
+    '<div class="two"><label>Numéro qui reçoit les paiements<input id="s-momo" inputmode="tel" maxlength="30" value="' + esc(s.momo_number) + '"></label>' +
+    '<label>Nom du titulaire<input id="s-momoname" maxlength="80" value="' + esc(s.momo_name) + '"></label></div>' +
+    '<label>Numéro WhatsApp de la boutique (avec indicatif, sans +, ex : 237612345678)<input id="s-wa" inputmode="tel" maxlength="20" value="' + esc(s.whatsapp) + '"></label>' +
+    '<label>Groupes WhatsApp (séparés par des virgules)<textarea id="s-groups" rows="2" maxlength="600">' + esc(s.groups) + '</textarea></label>' +
+    '<h3 style="margin-top:6px">Stock réservé par les commandes</h3>' +
+    '<label>Remettre en rayon les articles d\'une commande dont le paiement n\'est pas validé au bout de (heures, 0 = jamais)<input id="s-hold" type="number" min="0" max="72" step="1" value="' + (s.hold_hours == null ? 6 : s.hold_hours) + '"></label>' +
+    '<button class="btn p" type="submit">Enregistrer</button></form>' +
+    '<div class="panel" style="margin-top:14px;max-width:520px"><b>Sauvegardes</b><p class="small muted" style="margin:4px 0 10px">Fichiers CSV à ouvrir dans Excel. Faites-en une par semaine et gardez-les ailleurs que sur ce téléphone ou cet ordinateur.</p>' +
+    '<div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn" data-act="exall">Toutes les commandes</button><button class="btn" data-act="exstock">Articles et stocks</button><button class="btn p" data-act="backup">Tout sauvegarder</button></div>' +
+    '<p class="small muted" style="margin:8px 0 0">' + (lastExport() ? 'Dernière sauvegarde complète : ' + new Date(lastExport()).toLocaleDateString('fr-FR') + '.' : 'Aucune sauvegarde complète faite pour le moment.') + '</p></div>' +
+    '<div class="panel" style="margin-top:14px;max-width:520px"><b>Libérer de la place</b><p class="small muted" style="margin:4px 0 10px">Supprime les captures de paiement des commandes livrées, annulées ou expirées depuis plus de 30 jours. Les commandes restent dans la liste.</p>' +
+    '<button class="btn d" data-act="purge">' + (ui.confirm === 'purge' ? 'Confirmer la suppression' : 'Supprimer les anciennes captures') + '</button></div>';
+}
+async function purgeProofs() {
+  var limit = new Date(Date.now() - 30 * 864e5).toISOString();
+  var q = await sb.from('orders').select('id, proof_path').not('proof_path', 'is', null).in('status', ['livrée', 'annulée', 'expirée']).lt('created_at', limit).limit(500);
+  if (q.error) { fail('Suppression impossible', q.error); return; }
+  var old = q.data;
+  if (!old.length) { ui.confirm = null; draw(); toast('Aucune capture à supprimer'); return; }
+  var rm = await sb.storage.from('proofs').remove(old.map(function (o) { return o.proof_path; }));
+  if (rm.error) { fail('Suppression impossible', rm.error); return; }
+  var f = await sb.rpc('forget_proofs', { p_ids: old.map(function (o) { return o.id; }) });
+  if (f.error) { fail('Mise à jour impossible', f.error); return; }
+  try { await loadOrders(false); } catch (e) {}
+  ui.confirm = null; draw(); toast(old.length + ' capture(s) supprimée(s)' + (old.length >= 500 ? ' — relancez pour continuer' : ''));
+}
+
+/* ---------- Evenements ---------- */
+document.addEventListener('click', async function (e) {
+  var t = e.target.closest('[data-act]');
+  if (!t || t.tagName === 'INPUT' || t.tagName === 'SELECT') return;
+  var a = t.dataset.act, id = t.dataset.id, p;
+  if (a === 'logout') {
+    if (ui.channel) { try { sb.removeChannel(ui.channel); } catch (x) {} ui.channel = null; }
+    clearInterval(ui.timer); await sb.auth.signOut(); $('#who').hidden = true; $('#main').innerHTML = loginHTML();
+  }
+  else if (a === 'tab') { ui.tab = t.dataset.t; ui.confirm = null; ui.edit = null; ui.adding = false; ui.img = undefined; draw(); if (ui.tab === 'orders') refresh(true); }
+  else if (a === 'more') {
+    if (ui.more) return;
+    ui.more = true; ordersList();
+    try { await loadOrders(true); } catch (x) { fail('Chargement impossible', x); }
+    ui.more = false; ordersList();
+  }
+  else if (a === 'csv') runExport('list');
+  else if (a === 'exall') runExport('all');
+  else if (a === 'exstock') runExport('stock');
+  else if (a === 'backup') runExport('backup');
+  else if (a === 'cleardates') { ui.from = ''; ui.to = ''; draw(); applyFilter(); }
+  else if (a === 'searchref') { ui.oq = t.dataset.ref; ui.of = 'toutes'; ui.from = ''; ui.to = ''; draw(); applyFilter(); }
+  else if (a === 'reinstate') reinstate(id);
+  else if (a === 'proof') showProof(id);
+  else if (a === 'paid') setStatus(id, 'payée', 'Paiement validé');
+  else if (a === 'cancel') {
+    if (ui.confirm !== id) { ui.confirm = id; ordersList(); return; }
+    setStatus(id, 'annulée', 'Commande annulée, stock remis en rayon');
+  }
+  else if (a === 'newp') { ui.adding = true; ui.edit = null; ui.img = undefined; draw(); $('#p-name').focus(); }
+  else if (a === 'edit') { ui.edit = id; ui.adding = false; ui.img = undefined; draw(); $('#p-name').focus(); }
+  else if (a === 'canceledit') { ui.edit = null; ui.adding = false; ui.img = undefined; draw(); }
+  else if (a === 'rmimg') { ui.img = ''; ui.imgBlobs = null; $('#p-prev').innerHTML = ''; }
+  else if (a === 'toggle') {
+    p = PRODUCTS.find(function (x) { return x.id === id; });
+    var r = await sb.from('products').update({ active: !p.active }).eq('id', id);
+    if (r.error) return fail('Action impossible', r.error);
+    await loadProducts(); draw(); toast(p.active ? 'Article visible' : 'Article masqué');
+  }
+  else if (a === 'del') {
+    if (ui.confirm !== id) { ui.confirm = id; draw(); return; }
+    deleteProduct(PRODUCTS.find(function (x) { return x.id === id; }));
+  }
+  else if (a === 'purge') { if (ui.confirm !== 'purge') { ui.confirm = 'purge'; draw(); return; } purgeProofs(); }
+});
+document.addEventListener('input', function (e) {
+  if (e.target.id === 'oq') { ui.oq = e.target.value; clearTimeout(ui.searchTimer); ui.searchTimer = setTimeout(applyFilter, 350); }
+});
+document.addEventListener('change', async function (e) {
+  var t = e.target;
+  if (t.id === 'of') { ui.of = t.value; applyFilter(); }
+  else if (t.id === 'df' || t.id === 'dt') {
+    ui[t.id === 'df' ? 'from' : 'to'] = t.value;
+    var cd = $('[data-act="cleardates"]'); if (cd) cd.hidden = !(ui.from || ui.to);
+    applyFilter();
+  }
+  else if (t.id === 'snd') { ui.sound = t.checked; lsSet('boutique-son', t.checked ? '1' : '0'); if (t.checked) beep(); }
+  else if (t.dataset.act === 'status') setStatus(t.dataset.id, t.value, 'Statut mis à jour');
+  else if (t.dataset.act === 'qty') {
+    var v = Math.max(0, Math.floor(+t.value || 0));
+    var r = await sb.from('product_sizes').update({ stock: v }).eq('id', t.dataset.id);
+    if (r.error) return fail('Mise à jour impossible', r.error);
+    await loadProducts(); draw(); toast('Stock mis à jour');
+  }
+  else if (t.id === 'p-img' && t.files[0]) {
+    try {
+      var full = await B.shrink(t.files[0], 900, 0.72), thumb = await B.shrink(t.files[0], 420, 0.7);
+      ui.imgBlobs = { full: full, thumb: thumb };
+      ui.img = URL.createObjectURL(thumb);
+      $('#p-prev').innerHTML = '<img class="thumb lg" src="' + ui.img + '" alt="Aperçu"> <button class="linkbtn small" type="button" data-act="rmimg">Retirer la photo</button>';
+    } catch (x) { $('#p-err').textContent = 'Cette image ne peut pas être lue.'; }
+  }
+});
+document.addEventListener('submit', async function (e) {
+  e.preventDefault();
+  var id = e.target.id;
+  if (id === 'login') {
+    try { audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)(); } catch (x) {}
+    var r = await sb.auth.signInWithPassword({ email: $('#l-email').value.trim(), password: $('#l-pass').value });
+    if (r.error) { $('#l-err').textContent = 'E-mail ou mot de passe incorrect.'; return; }
+    $('#main').innerHTML = '<div class="empty">Chargement…</div>';
+    try { await enter(r.data.user); } catch (x) { $('#main').innerHTML = loginHTML('Chargement impossible. Réessayez.'); }
+  }
+  else if (id === 'pf') saveProduct();
+  else if (id === 'sf') {
+    var v = function (s) { return $(s).value.trim(); };
+    var u = await sb.from('settings').update({ shop_name: v('#s-shop') || 'Ophiria Boutique', currency: v('#s-cur') || 'FCFA', momo_ops: v('#s-ops'), momo_number: v('#s-momo'),
+      momo_name: v('#s-momoname'), whatsapp: v('#s-wa').replace(/\D/g, ''), groups: $('#s-groups').value.trim(),
+      hold_hours: Math.min(72, Math.max(0, Math.floor(+$('#s-hold').value || 0))) }).eq('id', 1);
+    if (u.error) return fail('Enregistrement impossible', u.error);
+    await loadSettings(); draw(); toast('Réglages enregistrés');
+  }
+});
+document.addEventListener('click', function () { try { if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch (x) {} }, { once: true });
+
+start();
+})();
+</script>
+</body>
+</html>
